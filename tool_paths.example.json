@@ -1,0 +1,4 @@
+{
+  "samtools": "/path/to/samtools",
+  "bcftools": "/path/to/bcftools"
+}
