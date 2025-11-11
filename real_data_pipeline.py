@@ -12,6 +12,10 @@ This script automates the following steps:
 
 External tools (samtools / bcftools) can be provided through a JSON config file.
 See ``tool_paths.example.json`` for the expected format.
+
+The pipeline records its progress in ``pipeline_state.json`` inside the output
+directory. Steps whose outputs already exist and match the recorded metadata are
+skipped on subsequent runs unless explicitly re-run with ``--force-step``.
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pysam
@@ -34,8 +38,118 @@ import multi_sample_v8a as msim
 LOGGER = logging.getLogger("purity_pipeline")
 
 
+class PipelineState:
+    """Tracks completion of pipeline steps and associated outputs."""
+
+    GLOBAL_KEY = "__global__"
+
+    def __init__(self, path: pathlib.Path, forced: Optional[Dict[str, Set[str]]] = None) -> None:
+        self.path = path
+        self.forced: Dict[str, Set[str]] = forced or {}
+        self.state: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        if path.exists():
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    raw: Dict[str, Dict[str, Dict[str, Any]]] = json.load(handle)
+                self.state = raw
+            except json.JSONDecodeError:
+                LOGGER.warning("State file %s is not valid JSON; starting with an empty state", path)
+
+    def _norm_key(self, key: Optional[str]) -> str:
+        return key if key is not None else self.GLOBAL_KEY
+
+    def _is_forced(self, step: str, key: Optional[str]) -> bool:
+        forced_keys = self.forced.get(step, set())
+        normalized = self._norm_key(key)
+        return PipelineState.GLOBAL_KEY in forced_keys or normalized in forced_keys
+
+    def is_forced(self, step: str, key: Optional[str] = None) -> bool:
+        return self._is_forced(step, key)
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w", encoding="utf-8") as handle:
+            json.dump(self.state, handle, indent=2)
+
+    def is_done(
+        self,
+        step: str,
+        key: Optional[str] = None,
+        *,
+        expected_metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if self._is_forced(step, key):
+            return False
+        step_state = self.state.get(step)
+        if not step_state:
+            return False
+        entry = step_state.get(self._norm_key(key))
+        if not entry:
+            return False
+        outputs = entry.get("outputs", [])
+        for output in outputs:
+            if not pathlib.Path(output).exists():
+                return False
+        if expected_metadata is not None:
+            stored = entry.get("metadata", {})
+            for meta_key, meta_val in expected_metadata.items():
+                if stored.get(meta_key) != meta_val:
+                    return False
+        return True
+
+    def get_metadata(self, step: str, key: Optional[str] = None) -> Dict[str, Any]:
+        step_state = self.state.get(step)
+        if not step_state:
+            return {}
+        entry = step_state.get(self._norm_key(key))
+        if not entry:
+            return {}
+        metadata = entry.get("metadata")
+        if isinstance(metadata, dict):
+            return metadata
+        return {}
+
+    def mark_done(
+        self,
+        step: str,
+        key: Optional[str] = None,
+        *,
+        outputs: Sequence[pathlib.Path] = (),
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        step_state = self.state.setdefault(step, {})
+        normalized = self._norm_key(key)
+        entry = {
+            "outputs": [str(path) for path in outputs],
+            "metadata": metadata or {},
+        }
+        step_state[normalized] = entry
+        self.save()
+
+
 class CommandError(RuntimeError):
     """Raised when an external command fails."""
+
+
+def parse_force_steps(values: Sequence[str]) -> Dict[str, Set[str]]:
+    forced: Dict[str, Set[str]] = {}
+    for raw in values:
+        if not raw:
+            continue
+        if ":" in raw:
+            step, key = raw.split(":", 1)
+            step = step.strip()
+            key = key.strip()
+            if not step:
+                continue
+            forced.setdefault(step, set()).add(key or PipelineState.GLOBAL_KEY)
+        else:
+            forced.setdefault(raw.strip(), set()).add(PipelineState.GLOBAL_KEY)
+    return forced
+
+
+def round_float(value: float, digits: int = 12) -> float:
+    return round(value, digits)
 
 
 @dataclass
@@ -106,7 +220,7 @@ def locate_cram(sample: str, cram_dir: pathlib.Path) -> pathlib.Path:
 
 
 def extract_bases_mapped(stats_file: pathlib.Path) -> float:
-    pattern = re.compile(r"^SN\s+bases mapped:\s+(\d+)")
+    pattern = re.compile(r"^bases mapped:\s+(\d+)")
     with stats_file.open("r", encoding="utf-8") as handle:
         for line in handle:
             match = pattern.search(line)
@@ -125,23 +239,57 @@ def collect_sample_configs(
     tools: Dict[str, str],
     threads: int,
     seed: int,
+    state: PipelineState,
 ) -> List[SampleConfig]:
     configs: List[SampleConfig] = []
     for index, (sample, weight) in enumerate(percentages.items()):
         cram_path = locate_cram(sample, cram_dir)
         stats_path = outdir / "stats" / f"{sample}.stats.txt"
         stats_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd_stats = [
-            tools["samtools"],
-            "stats",
-            "-@",
-            str(threads),
-            "--reference",
-            str(reference),
-            str(cram_path),
-        ]
-        run_command(cmd_stats, stats_path)
-        total_bases = extract_bases_mapped(stats_path)
+        total_bases: Optional[float] = None
+        stats_done = state.is_done("samtools_stats", sample)
+        forced_stats = state.is_forced("samtools_stats", sample)
+        if stats_done:
+            LOGGER.info("Stats for %s already recorded at %s; skipping", sample, stats_path)
+            meta = state.get_metadata("samtools_stats", sample)
+            if "bases_mapped" in meta:
+                try:
+                    total_bases = float(meta["bases_mapped"])
+                except (TypeError, ValueError):
+                    total_bases = None
+        elif stats_path.exists() and not forced_stats:
+            LOGGER.info("Found existing stats output for %s at %s; reusing", sample, stats_path)
+            total_bases = extract_bases_mapped(stats_path)
+            state.mark_done(
+                "samtools_stats",
+                sample,
+                outputs=[stats_path],
+                metadata={"bases_mapped": total_bases},
+            )
+        else:
+            if forced_stats:
+                LOGGER.info("Forcing regeneration of stats for %s", sample)
+            elif stats_path.exists():
+                LOGGER.info("Metadata mismatch for %s stats; recomputing", sample)
+            cmd_stats = [
+                tools["samtools"],
+                "stats",
+                "-@",
+                str(threads),
+                "--reference",
+                str(reference),
+                str(cram_path),
+            ]
+            run_command(cmd_stats, stats_path)
+            total_bases = extract_bases_mapped(stats_path)
+            state.mark_done(
+                "samtools_stats",
+                sample,
+                outputs=[stats_path],
+                metadata={"bases_mapped": total_bases},
+            )
+        if total_bases is None:
+            raise ValueError(f"Could not determine mapped bases for sample {sample}")
         target_bases = genome_size * target_depth * weight
         fraction = min(target_bases / total_bases if total_bases else 0.0, 1.0)
         bam_path = outdir / "downsampled" / f"{sample}.subsampled.bam"
@@ -173,7 +321,45 @@ def subsample_cram(
     reference: pathlib.Path,
     threads: int,
     seed: int,
+    state: PipelineState,
 ) -> None:
+    metadata = {
+        "fraction": round_float(sample_cfg.fraction),
+        "seed": int(seed),
+        "reference": str(reference),
+    }
+    bam_index = sample_cfg.bam_path.with_suffix(sample_cfg.bam_path.suffix + ".bai")
+    prev_metadata = state.get_metadata("downsample", sample_cfg.name)
+    if state.is_done("downsample", sample_cfg.name, expected_metadata=metadata):
+        LOGGER.info(
+            "Downsampled BAM for %s already exists at %s; skipping",
+            sample_cfg.name,
+            sample_cfg.bam_path,
+        )
+        return
+    forced = state.is_forced("downsample", sample_cfg.name)
+    if (
+        not forced
+        and sample_cfg.bam_path.exists()
+        and bam_index.exists()
+        and (not prev_metadata or prev_metadata == metadata)
+    ):
+        LOGGER.info(
+            "Downsampled BAM for %s found at %s; reusing existing file",
+            sample_cfg.name,
+            sample_cfg.bam_path,
+        )
+        state.mark_done(
+            "downsample",
+            sample_cfg.name,
+            outputs=[sample_cfg.bam_path, bam_index],
+            metadata=metadata,
+        )
+        return
+    if forced:
+        LOGGER.info("Forcing regeneration of downsampled BAM for %s", sample_cfg.name)
+    elif prev_metadata and prev_metadata != metadata:
+        LOGGER.info("Metadata change detected for %s; regenerating downsampled BAM", sample_cfg.name)
     if sample_cfg.fraction >= 0.999999:
         LOGGER.info("Fraction for %s >= 1.0, converting to BAM without subsampling", sample_cfg.name)
         cmd_view = [
@@ -224,6 +410,12 @@ def subsample_cram(
     cmd_index = [tools["samtools"], "index", "-@", str(threads), str(sample_cfg.bam_path)]
     index_log = sample_cfg.bam_path.parent / f"{sample_cfg.name}.index.log"
     run_command(cmd_index, index_log)
+    state.mark_done(
+        "downsample",
+        sample_cfg.name,
+        outputs=[sample_cfg.bam_path, bam_index],
+        metadata=metadata,
+    )
 
 
 def merge_bams(
@@ -231,10 +423,40 @@ def merge_bams(
     tools: Dict[str, str],
     outdir: pathlib.Path,
     threads: int,
+    state: PipelineState,
 ) -> pathlib.Path:
     merged_unsorted = outdir / "pooled.unsorted.bam"
     merged_sorted = outdir / "pooled.sorted.bam"
     merge_log = outdir / "merge.log"
+    merged_index = merged_sorted.with_suffix(merged_sorted.suffix + ".bai")
+    metadata = {
+        "inputs": [str(cfg.bam_path) for cfg in configs],
+        "threads": int(threads),
+        "samples": [cfg.name for cfg in configs],
+        "input_metadata": [state.get_metadata("downsample", cfg.name) for cfg in configs],
+    }
+    if state.is_done("merge_pooled_bam", expected_metadata=metadata):
+        LOGGER.info("Merged pooled BAM already exists at %s; skipping merge", merged_sorted)
+        return merged_sorted
+    prev_metadata = state.get_metadata("merge_pooled_bam")
+    forced = state.is_forced("merge_pooled_bam")
+    if (
+        not forced
+        and merged_sorted.exists()
+        and merged_index.exists()
+        and (not prev_metadata)
+    ):
+        LOGGER.info("Merged BAM found at %s; reusing existing file", merged_sorted)
+        state.mark_done(
+            "merge_pooled_bam",
+            outputs=[merged_sorted, merged_index],
+            metadata=metadata,
+        )
+        return merged_sorted
+    if forced:
+        LOGGER.info("Forcing regeneration of pooled BAM at %s", merged_sorted)
+    elif prev_metadata and prev_metadata != metadata:
+        LOGGER.info("Metadata change detected for pooled BAM; regenerating %s", merged_sorted)
     cmd_merge = [tools["samtools"], "merge", "-@", str(threads), "-f", str(merged_unsorted)]
     cmd_merge.extend(str(cfg.bam_path) for cfg in configs)
     run_command(cmd_merge, merge_log)
@@ -245,6 +467,11 @@ def merge_bams(
     index_log = outdir / "pooled.index.log"
     cmd_index = [tools["samtools"], "index", "-@", str(threads), str(merged_sorted)]
     run_command(cmd_index, index_log)
+    state.mark_done(
+        "merge_pooled_bam",
+        outputs=[merged_sorted, merged_index],
+        metadata=metadata,
+    )
     return merged_sorted
 
 
@@ -253,9 +480,35 @@ def filter_vcf(
     tools: Dict[str, str],
     outdir: pathlib.Path,
     chrom: str,
+    state: PipelineState,
 ) -> pathlib.Path:
     filtered_vcf = outdir / f"variants.{chrom}.snps.vcf.gz"
     filter_log = outdir / f"bcftools.filter.{chrom}.log"
+    index_path = filtered_vcf.with_suffix(filtered_vcf.suffix + ".csi")
+    metadata = {"chrom": chrom, "source_vcf": str(vcf_path)}
+    if state.is_done("filter_vcf", chrom, expected_metadata=metadata):
+        LOGGER.info("Filtered VCF for %s already exists at %s; skipping", chrom, filtered_vcf)
+        return filtered_vcf
+    prev_metadata = state.get_metadata("filter_vcf", chrom)
+    forced = state.is_forced("filter_vcf", chrom)
+    if (
+        not forced
+        and filtered_vcf.exists()
+        and index_path.exists()
+        and (not prev_metadata)
+    ):
+        LOGGER.info("Filtered VCF for %s found at %s; reusing", chrom, filtered_vcf)
+        state.mark_done(
+            "filter_vcf",
+            chrom,
+            outputs=[filtered_vcf, index_path],
+            metadata=metadata,
+        )
+        return filtered_vcf
+    if forced:
+        LOGGER.info("Forcing regeneration of filtered VCF for %s", chrom)
+    elif prev_metadata and prev_metadata != metadata:
+        LOGGER.info("Metadata change detected for filtered VCF %s; regenerating", chrom)
     cmd = [
         tools["bcftools"],
         "view",
@@ -274,6 +527,12 @@ def filter_vcf(
     index_log = outdir / f"bcftools.index.{chrom}.log"
     cmd_index = [tools["bcftools"], "index", "-f", str(filtered_vcf)]
     run_command(cmd_index, index_log)
+    state.mark_done(
+        "filter_vcf",
+        chrom,
+        outputs=[filtered_vcf, index_path],
+        metadata=metadata,
+    )
     return filtered_vcf
 
 
@@ -369,6 +628,33 @@ def save_counts(
     return output
 
 
+def load_counts(path: pathlib.Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[str, int, str, str]]]:
+    snps: List[Tuple[str, int, str, str]] = []
+    alt_counts: List[int] = []
+    total_counts: List[int] = []
+    genotypes: List[float] = []
+    with path.open("r", encoding="utf-8") as handle:
+        header_read = False
+        for line in handle:
+            if not header_read:
+                header_read = True
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            chrom, pos, ref, alt, alt_depth, total_depth, genotype = line.split("\t")
+            snps.append((chrom, int(pos), ref, alt))
+            alt_counts.append(int(alt_depth))
+            total_counts.append(int(total_depth))
+            genotypes.append(float(genotype))
+    return (
+        np.array(alt_counts, dtype=np.int32),
+        np.array(total_counts, dtype=np.int32),
+        np.array(genotypes, dtype=np.float32),
+        snps,
+    )
+
+
 def estimate_purity(
     k_total: np.ndarray,
     n_total: np.ndarray,
@@ -437,11 +723,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--em-tau", type=float, nargs="*", default=(1.0, 0.7, 0.5, 0.3, 0.2, 0.1, 0.05))
     parser.add_argument("--em-use-bic", action="store_true")
     parser.add_argument("--em-use-icl", action="store_true")
+    parser.add_argument(
+        "--force-step",
+        action="append",
+        default=[],
+        metavar="STEP[:KEY]",
+        help=(
+            "Re-run a pipeline step even if its outputs exist. Can be provided multiple times. "
+            "Use STEP for all keys or STEP:KEY for a specific sample/chromosome."
+        ),
+    )
     args = parser.parse_args(argv)
 
     setup_logging(args.log_level)
     args.outdir.mkdir(parents=True, exist_ok=True)
     tools = load_tool_paths(args.tool_config)
+
+    state = PipelineState(
+        args.outdir / "pipeline_state.json",
+        forced=parse_force_steps(args.force_step),
+    )
 
     percentages = parse_percentage_file(args.percentage_file)
     configs = collect_sample_configs(
@@ -454,18 +755,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tools,
         args.threads,
         args.seed,
+        state,
     )
     for cfg in configs:
-        subsample_cram(cfg, tools, args.reference, args.threads, args.seed)
-    merged_bam = merge_bams(configs, tools, args.outdir, args.threads)
-    filtered_vcf = filter_vcf(args.vcf, tools, args.outdir, args.chrom)
-    k_total, n_total, g_codes, snps = fetch_allele_counts(
-        merged_bam,
-        filtered_vcf,
-        args.standard_sample,
-        args.min_depth,
-    )
-    counts_path = save_counts(args.outdir, snps, k_total, n_total, g_codes)
+        subsample_cram(cfg, tools, args.reference, args.threads, args.seed, state)
+    merged_bam = merge_bams(configs, tools, args.outdir, args.threads, state)
+    filtered_vcf = filter_vcf(args.vcf, tools, args.outdir, args.chrom, state)
+    counts_path = args.outdir / "allele_counts.tsv"
+    counts_metadata = {
+        "chrom": args.chrom,
+        "standard_sample": args.standard_sample,
+        "min_depth": int(args.min_depth),
+        "merged_metadata": state.get_metadata("merge_pooled_bam"),
+        "filtered_metadata": state.get_metadata("filter_vcf", args.chrom),
+        "merged_bam": str(merged_bam),
+        "filtered_vcf": str(filtered_vcf),
+    }
+    prev_counts_meta = state.get_metadata("allele_counts", args.chrom)
+    forced_counts = state.is_forced("allele_counts", args.chrom)
+    if state.is_done("allele_counts", args.chrom, expected_metadata=counts_metadata):
+        LOGGER.info("Allele counts already present at %s; loading", counts_path)
+        k_total, n_total, g_codes, snps = load_counts(counts_path)
+    elif not forced_counts and counts_path.exists() and (not prev_counts_meta):
+        LOGGER.info("Allele counts file detected at %s; reusing", counts_path)
+        k_total, n_total, g_codes, snps = load_counts(counts_path)
+        state.mark_done(
+            "allele_counts",
+            args.chrom,
+            outputs=[counts_path],
+            metadata=counts_metadata,
+        )
+    else:
+        if forced_counts:
+            LOGGER.info("Forcing regeneration of allele counts for %s", args.chrom)
+        elif prev_counts_meta and prev_counts_meta != counts_metadata:
+            LOGGER.info("Metadata change detected for allele counts on %s; recomputing", args.chrom)
+        k_total, n_total, g_codes, snps = fetch_allele_counts(
+            merged_bam,
+            filtered_vcf,
+            args.standard_sample,
+            args.min_depth,
+        )
+        counts_path = save_counts(args.outdir, snps, k_total, n_total, g_codes)
+        state.mark_done(
+            "allele_counts",
+            args.chrom,
+            outputs=[counts_path],
+            metadata=counts_metadata,
+        )
     em_config = {
         "do_em": not args.skip_em,
         "k_min": args.em_k_min,
@@ -510,6 +847,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ],
         "allele_counts": str(counts_path),
         "purity": purity_results,
+        "pipeline_state": str(state.path),
     }
     summary_path = args.outdir / "purity_summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
