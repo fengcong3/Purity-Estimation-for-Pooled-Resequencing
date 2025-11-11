@@ -1,4 +1,4 @@
 {
-  "samtools": "/path/to/samtools",
-  "bcftools": "/path/to/bcftools"
+  "samtools": "/public/home/fengcong/mambaforge-pypy3/envs/samtools/bin/samtools",
+  "bcftools": "/public/home/fengcong/mambaforge-pypy3/bin/bcftools"
 }

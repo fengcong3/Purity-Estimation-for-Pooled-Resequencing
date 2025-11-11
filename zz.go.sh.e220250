@@ -1,0 +1,16 @@
+2025-11-10 15:31:05 [INFO] Sample JI0082: target=7.83 Gb total=69.47 Gb fraction=0.1127
+2025-11-10 16:02:04 [INFO] Sample JI0323: target=3.73 Gb total=117.26 Gb fraction=0.0319
+2025-11-10 16:22:15 [INFO] Sample JI0466: target=6.84 Gb total=73.07 Gb fraction=0.0936
+2025-11-10 16:52:28 [INFO] Sample JI1491: target=9.40 Gb total=112.63 Gb fraction=0.0835
+2025-11-10 17:11:41 [INFO] Sample JI1794: target=5.26 Gb total=68.30 Gb fraction=0.0771
+2025-11-10 17:34:45 [INFO] Sample JI2174: target=11.93 Gb total=82.80 Gb fraction=0.1440
+Traceback (most recent call last):
+  File "real_data_pipeline.py", line 522, in <module>
+    sys.exit(main())
+  File "real_data_pipeline.py", line 459, in main
+    subsample_cram(cfg, tools, args.reference, args.threads, args.seed)
+  File "real_data_pipeline.py", line 222, in subsample_cram
+    run_command(cmd_sort, sort_log)
+  File "real_data_pipeline.py", line 78, in run_command
+    raise CommandError(f"Command failed with exit code {proc.returncode}: {' '.join(cmd)}")
+__main__.CommandError: Command failed with exit code 1: /public/agis/chengshifeng_group/fengcong/WGRS/software/samtools-1.9/bin/samtools sort -@ 8 -o results/downsampled/JI0082.subsampled.bam results/downsampled/JI0082.tmp.bam

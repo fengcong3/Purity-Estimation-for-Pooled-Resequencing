@@ -276,7 +276,7 @@ def collect_sample_configs(
                 "stats",
                 "-@",
                 str(threads),
-                "-T",
+                "--reference",
                 str(reference),
                 str(cram_path),
             ]
