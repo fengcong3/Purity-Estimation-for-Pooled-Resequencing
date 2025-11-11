@@ -106,7 +106,7 @@ def locate_cram(sample: str, cram_dir: pathlib.Path) -> pathlib.Path:
 
 
 def extract_bases_mapped(stats_file: pathlib.Path) -> float:
-    pattern = re.compile(r"^bases mapped:\s+(\d+)")
+    pattern = re.compile(r"^SN\s+bases mapped:\s+(\d+)")
     with stats_file.open("r", encoding="utf-8") as handle:
         for line in handle:
             match = pattern.search(line)
@@ -136,7 +136,7 @@ def collect_sample_configs(
             "stats",
             "-@",
             str(threads),
-            "-T",
+            "--reference",
             str(reference),
             str(cram_path),
         ]
