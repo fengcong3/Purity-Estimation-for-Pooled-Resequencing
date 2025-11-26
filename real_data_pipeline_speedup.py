@@ -27,8 +27,11 @@ import pathlib
 import re
 import subprocess
 import sys
+import gc
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from multiprocessing import Pool, Manager
+from functools import partial
 
 import numpy as np
 import pysam
@@ -270,7 +273,7 @@ def collect_sample_configs(
             if forced_stats:
                 LOGGER.info("Forcing regeneration of stats for %s", sample)
             elif stats_path.exists():
-                LOGGER.info("Metadata mismatch for %s stats; recomputing", sample)
+                LOGGER.info("Metadata mismatch for %s stats; recomputing", sample, stats_path)
             cmd_stats = [
                 tools["samtools"],
                 "stats",
@@ -550,39 +553,33 @@ def genotype_to_code(gt: Tuple[int, int]) -> float:
     return float("nan")
 
 
-def fetch_allele_counts(
-    bam_path: pathlib.Path,
-    vcf_path: pathlib.Path,
-    standard_sample: str,
-    min_depth: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[str, int, str, str]]]:
+def genotype_to_int(gt_code: float) -> int:
+    """Convert genotype code to integer for output."""
+    if gt_code == 0.0:
+        return 0
+    elif gt_code == 1.0:
+        return 1
+    else:
+        return -1  # Should not happen with filtered data
+
+
+def process_snp_chunk(
+    chunk_data: Tuple[List[Any], str, int, str],
+    bam_path: str,
+) -> Tuple[List[int], List[int], List[float], List[Tuple[str, int, str, str]]]:
+    """Process a chunk of SNPs and return counts."""
+    records, standard_sample, min_depth, chunk_id = chunk_data
     bam = pysam.AlignmentFile(bam_path, "rb")
-    vcf = pysam.VariantFile(vcf_path)
-    if standard_sample not in vcf.header.samples:
-        raise KeyError(f"Standard sample {standard_sample} not present in VCF")
+    
     k_total: List[int] = []
     n_total: List[int] = []
     g_codes: List[float] = []
     snp_records: List[Tuple[str, int, str, str]] = []
-    for rec in vcf.fetch():
-        sample_data = rec.samples[standard_sample]
-        gt = sample_data.get("GT")
-        if gt is None or len(gt) != 2:
-            continue
-        gt_code = genotype_to_code(gt)
-        if not (gt_code == gt_code):
-            continue
-        # Skip heterozygous sites - only use homozygous sites (0.0 or 1.0)
-        if gt_code == 0.5:
-            continue
-        if len(rec.alts) != 1:
-            continue
-        chrom = rec.chrom
-        pos = rec.pos
-        ref = rec.ref.upper()
-        alt = rec.alts[0].upper()
+    
+    for rec_data in records:
+        chrom, pos, ref, alt, gt_code = rec_data
         
-        # Process pileup immediately within the iterator
+        # Process pileup
         ref_count = 0
         alt_count = 0
         for pileup_col in bam.pileup(
@@ -594,7 +591,6 @@ def fetch_allele_counts(
             max_depth=1_000_000,
         ):
             if pileup_col.pos == pos - 1:
-                # Process reads immediately while iterator is active
                 for pileup_read in pileup_col.pileups:
                     if pileup_read.is_del or pileup_read.is_refskip:
                         continue
@@ -615,9 +611,180 @@ def fetch_allele_counts(
         n_total.append(total)
         g_codes.append(gt_code)
         snp_records.append((chrom, pos, ref, alt))
+    
     bam.close()
+    gc.collect()
+    
+    return k_total, n_total, g_codes, snp_records
+
+
+def fetch_allele_counts(
+    bam_path: pathlib.Path,
+    vcf_path: pathlib.Path,
+    standard_sample: str,
+    min_depth: int,
+    max_snps: Optional[int] = None,
+    num_processes: int = 1,
+    chunk_size: int = 1000,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[str, int, str, str]]]:
+    """Fetch allele counts with multiprocessing support."""
+    vcf = pysam.VariantFile(vcf_path)
+    if standard_sample not in vcf.header.samples:
+        raise KeyError(f"Standard sample {standard_sample} not present in VCF")
+    
+    # First pass: collect SNP information with MAF filtering and genotype separation
+    LOGGER.info("Scanning VCF for valid SNPs (MAF 0.2-0.5, homozygous sites only)...")
+    snps_gt0: List[Tuple[str, int, str, str, float]] = []  # REF homozygous (genotype 0)
+    snps_gt1: List[Tuple[str, int, str, str, float]] = []  # ALT homozygous (genotype 1)
+    
+    for rec in vcf.fetch():
+        # Calculate MAF (Minor Allele Frequency)
+        # Get allele frequencies from INFO field if available
+        af = None
+        if 'AF' in rec.info:
+            af_values = rec.info['AF']
+            if isinstance(af_values, (list, tuple)):
+                af = af_values[0] if len(af_values) > 0 else None
+            else:
+                af = af_values
+        
+        # Calculate MAF: MAF is the minimum of AF and (1-AF)
+        if af is not None:
+            maf = min(af, 1.0 - af)
+            # Filter: only keep SNPs with MAF between 0.2 and 0.5
+            if maf < 0.2 or maf > 0.5:
+                continue
+        else:
+            # If AF is not available, skip this SNP or log a warning
+            continue
+            
+        sample_data = rec.samples[standard_sample]
+        gt = sample_data.get("GT")
+        if gt is None or len(gt) != 2:
+            continue
+        gt_code = genotype_to_code(gt)
+        if not (gt_code == gt_code):  # Check for NaN
+            continue
+        # Skip heterozygous (0.5) sites
+        if gt_code == 0.5:
+            continue
+        if len(rec.alts) != 1:
+            continue
+        
+        chrom = rec.chrom
+        pos = rec.pos
+        ref = rec.ref.upper()
+        alt = rec.alts[0].upper()
+        
+        # Separate by genotype
+        if gt_code == 0.0:
+            snps_gt0.append((chrom, pos, ref, alt, gt_code))
+        elif gt_code == 1.0:
+            snps_gt1.append((chrom, pos, ref, alt, gt_code))
+    
     vcf.close()
-    return np.array(k_total, dtype=np.int32), np.array(n_total, dtype=np.int32), np.array(g_codes, dtype=np.float32), snp_records
+    
+    LOGGER.info("Found %d SNPs with genotype 0 (REF homozygous)", len(snps_gt0))
+    LOGGER.info("Found %d SNPs with genotype 1 (ALT homozygous)", len(snps_gt1))
+    
+    # Balance genotypes: ensure equal numbers of genotype 0 and 1
+    if max_snps is not None:
+        # Split max_snps equally between two genotypes
+        snps_per_genotype = max_snps // 2
+        
+        # Randomly sample if we have more SNPs than needed
+        if len(snps_gt0) > snps_per_genotype:
+            import random
+            random.seed(1234)  # Use a fixed seed for reproducibility
+            snps_gt0 = random.sample(snps_gt0, snps_per_genotype)
+            LOGGER.info("Sampled %d SNPs with genotype 0", snps_per_genotype)
+        
+        if len(snps_gt1) > snps_per_genotype:
+            import random
+            random.seed(1234)
+            snps_gt1 = random.sample(snps_gt1, snps_per_genotype)
+            LOGGER.info("Sampled %d SNPs with genotype 1", snps_per_genotype)
+    
+    # Combine both genotype groups
+    all_snp_data = snps_gt0 + snps_gt1
+    
+    total_snps = len(all_snp_data)
+    LOGGER.info("Total SNPs to process: %d (genotype 0: %d, genotype 1: %d)", 
+                total_snps, len(snps_gt0), len(snps_gt1))
+    
+    if total_snps == 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.float32), []
+    
+    # Split into chunks
+    chunks: List[Tuple[List[Any], str, int, str]] = []
+    for i in range(0, total_snps, chunk_size):
+        chunk = all_snp_data[i:i + chunk_size]
+        chunk_id = f"chunk_{i//chunk_size}"
+        chunks.append((chunk, standard_sample, min_depth, chunk_id))
+    
+    LOGGER.info("Processing %d SNPs in %d chunks using %d processes", total_snps, len(chunks), num_processes)
+    
+    # Process chunks
+    k_total: List[int] = []
+    n_total: List[int] = []
+    g_codes: List[float] = []
+    snp_records: List[Tuple[str, int, str, str]] = []
+    
+    process_func = partial(process_snp_chunk, bam_path=str(bam_path))
+    
+    if num_processes > 1:
+        with Pool(processes=num_processes) as pool:
+            for idx, result in enumerate(pool.imap(process_func, chunks)):
+                k_chunk, n_chunk, g_chunk, snp_chunk = result
+                k_total.extend(k_chunk)
+                n_total.extend(n_chunk)
+                g_codes.extend(g_chunk)
+                snp_records.extend(snp_chunk)
+                
+                processed_count = (idx + 1) * chunk_size
+                LOGGER.info(
+                    "Processed %d/%d SNPs (%.1f%%), current valid count: %d",
+                    min(processed_count, total_snps),
+                    total_snps,
+                    100.0 * min(processed_count, total_snps) / total_snps,
+                    len(snp_records)
+                )
+                sys.stdout.flush()
+                gc.collect()
+    else:
+        for idx, chunk_data in enumerate(chunks):
+            result = process_func(chunk_data)
+            k_chunk, n_chunk, g_chunk, snp_chunk = result
+            k_total.extend(k_chunk)
+            n_total.extend(n_chunk)
+            g_codes.extend(g_chunk)
+            snp_records.extend(snp_chunk)
+            
+            processed_count = (idx + 1) * chunk_size
+            LOGGER.info(
+                "Processed %d/%d SNPs (%.1f%%), current valid count: %d",
+                min(processed_count, total_snps),
+                total_snps,
+                100.0 * min(processed_count, total_snps) / total_snps,
+                len(snp_records)
+            )
+            sys.stdout.flush()
+            gc.collect()
+    
+    LOGGER.info("Completed processing. Total valid SNPs: %d", len(snp_records))
+    
+    # Log genotype distribution for debugging
+    g_array = np.array(g_codes)
+    n_ref_homo = np.sum(g_array == 0.0)
+    n_alt_homo = np.sum(g_array == 1.0)
+    LOGGER.info("Genotype distribution: REF homozygous = %d, ALT homozygous = %d", n_ref_homo, n_alt_homo)
+    
+    return (
+        np.array(k_total, dtype=np.int32),
+        np.array(n_total, dtype=np.int32),
+        np.array(g_codes, dtype=np.float32),
+        snp_records,
+    )
 
 
 def save_counts(
@@ -631,7 +798,8 @@ def save_counts(
     with output.open("w", encoding="utf-8") as handle:
         handle.write("chrom\tpos\tref\talt\talt_depth\ttotal_depth\tstd_genotype\n")
         for (chrom, pos, ref, alt), k, n, g in zip(snps, k_total, n_total, g_codes):
-            handle.write(f"{chrom}\t{pos}\t{ref}\t{alt}\t{k}\t{n}\t{g}\n")
+            g_int = genotype_to_int(g)
+            handle.write(f"{chrom}\t{pos}\t{ref}\t{alt}\t{k}\t{n}\t{g_int}\n")
     return output
 
 
@@ -653,6 +821,7 @@ def load_counts(path: pathlib.Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
             snps.append((chrom, int(pos), ref, alt))
             alt_counts.append(int(alt_depth))
             total_counts.append(int(total_depth))
+            # Convert integer genotype back to float for internal processing
             genotypes.append(float(genotype))
     return (
         np.array(alt_counts, dtype=np.int32),
@@ -740,6 +909,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Use STEP for all keys or STEP:KEY for a specific sample/chromosome."
         ),
     )
+    parser.add_argument(
+        "--max-snps",
+        type=int,
+        default=None,
+        help="Maximum number of SNPs to process for purity estimation (default: all SNPs)"
+    )
+    parser.add_argument(
+        "--snp-processes",
+        type=int,
+        default=1,
+        help="Number of parallel processes for SNP processing (default: 1)"
+    )
+    parser.add_argument(
+        "--snp-chunk-size",
+        type=int,
+        default=1000,
+        help="Number of SNPs to process per chunk (default: 1000)"
+    )
     args = parser.parse_args(argv)
 
     setup_logging(args.log_level)
@@ -773,6 +960,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "chrom": args.chrom,
         "standard_sample": args.standard_sample,
         "min_depth": int(args.min_depth),
+        "max_snps": args.max_snps,
         "merged_metadata": state.get_metadata("merge_pooled_bam"),
         "filtered_metadata": state.get_metadata("filter_vcf", args.chrom),
         "merged_bam": str(merged_bam),
@@ -802,6 +990,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             filtered_vcf,
             args.standard_sample,
             args.min_depth,
+            max_snps=args.max_snps,
+            num_processes=args.snp_processes,
+            chunk_size=args.snp_chunk_size,
         )
         counts_path = save_counts(args.outdir, snps, k_total, n_total, g_codes)
         state.mark_done(
@@ -840,6 +1031,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "genome_size": args.genome_size,
         "error_rate": args.error_rate,
         "min_depth": args.min_depth,
+        "max_snps": args.max_snps,
+        "snp_processes": args.snp_processes,
         "tools": tools,
         "samples": [
             {
